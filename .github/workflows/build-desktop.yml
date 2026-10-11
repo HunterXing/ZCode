@@ -272,6 +272,19 @@ jobs:
           done
           cp "${DMG[@]}" out/
           [ ${#ZIP[@]} -eq 0 ] || cp "${ZIP[@]}" out/
+          # blockmap 是 electron-updater 差分更新的必需文件，与 zip 同名放在旁边。
+          # glob 模式 *.zip 匹配不到 .zip.blockmap，必须单独收 —— 漏了它
+          # 应用内更新会静默退化成整包下载（deepseek-harness 那侧还要自己生成，
+          # 这里 electron-builder 已经产出了，只是没收）。
+          shopt -s nullglob
+          BMAP=(packages/desktop/dist/*-mac-*.zip.blockmap)
+          if [ ${#BMAP[@]} -gt 0 ]; then
+            echo "blockmap："
+            for f in "${BMAP[@]}"; do printf '  %s (%s)\n' "$f" "$(du -sh "$f" | cut -f1)"; done
+            cp "${BMAP[@]}" out/
+          else
+            echo "::warning::未找到 .zip.blockmap，差分更新会退化为整包下载"
+          fi
           ls -la out/
 
       # electron-updater 的 MacUpdater 只有拿到 <artifact>.blockmap 才会走差分下载，
