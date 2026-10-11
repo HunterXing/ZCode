@@ -95,25 +95,61 @@ jobs:
         # rebase 会重写历史，必须 force；但用 --force-with-lease，
         # 若远端在我 fetch 之后被别人推过就拒绝，避免覆盖他人改动。
         #
-        # 为什么必须用 PAT 而不是 GITHUB_TOKEN：
-        # rebase 会把上游新增/修改的 .github/workflows/*.yml 一并带进来，
-        # 而 GitHub 硬性禁止 GITHUB_TOKEN 修改 workflow 文件（防 workflow 自我提权），
+        # 凭据用 **SSH deploy key**（ZCODE_SSH_KEY_B64），不用 GITHUB_TOKEN 也不用 PAT。
+        #
+        # 为什么不能用 GITHUB_TOKEN：rebase 会把上游新增/修改的 .github/workflows/*.yml
+        # 一并带进来，而 GitHub 硬性禁止 GITHUB_TOKEN 修改 workflow 文件（防 workflow 自我提权），
         # push 会被拒：remote rejected ... without `workflows` permission。
-        # 这个限制**不是** permissions 块能解决的 —— 官方 GITHUB_TOKEN 权限键里
-        # 根本没有 `workflows`（只有 actions/checks/contents/... 十六个）。
-        # 唯一可行做法是用带 workflow scope 的 classic PAT（secret: ZCODE_SYNC_TOKEN）。
+        # 这个限制**不是** permissions 块能解决的 —— 官方 GITHUB_TOKEN 权限键里根本没有
+        # `workflows`（只有 actions/checks/contents/... 十六个）。
+        #
+        # 为什么不用 PAT：classic PAT + workflow scope 是可行的，但需要人工在网页建 token、
+        # 且有到期看护问题（过期后同步**静默停止**，不报错）。
+        # deploy key 没有到期概念、没有 scope 限制、也不经过 GitHub 的 OAuth 体系，
+        # 是一次配置长期有效的方案。私钥以 base64 存 Actions secret，
+        # 避免 multiline secret 在 YAML 里的转义坑。
         run: |
           set -euo pipefail
-          [ -n "${{ secrets.ZCODE_SYNC_TOKEN }}" ] || {
-            echo "::error::缺少 secret ZCODE_SYNC_TOKEN，无法推送 workflow 文件"; exit 1; }
-          # token 走 http.extraHeader 而**不是**塞进 remote URL：公开仓库的 Actions 日志
-          # 任何人可读，而 push 失败时 git 会把 remote URL 原样打进错误信息 ——
-          # 塞 URL 等于把 token 公开。extraHeader 不出现在任何 git 输出里。
-          git config http.https://github.com/.extraHeader \
-            "AUTHORIZATION: basic *** 'x-access-token:*** '${{ secrets.ZCODE_SYNC_TOKEN }}' | base64 -w0)"
-          trap 'git config --unset-all http.https://github.com/.extraHeader || true' EXIT
+          [ -n "${{ secrets.ZCODE_SSH_KEY_B64 }}" ] || {
+            echo "::error::缺少 secret ZCODE_SSH_KEY_B64，无法推送"; exit 1; }
+
+          KEY_PATH="$RUNNER_TEMP/zcode_sync_key"
+          # base64 单行解回私钥；umask 077 保证落地即 600，避免短暂的可读窗口。
+          (umask 077 && printf '%s' "${{ secrets.ZCODE_SSH_KEY_B64 }}" | base64 -d > "$KEY_PATH")
+          chmod 600 "$KEY_PATH"
+
+          # known_hosts 固定 GitHub 的公钥指纹。
+          # 不能用 StrictHostKeyChecking=no：那等于关掉主机身份校验，
+          # 一旦 DNS 或网络路径被劫持，私钥会被直接送到攻击者的服务器。
+          # 指纹取自 GitHub 官方文档（https://api.github.com/meta 或 /meta 的 ssh_key_fingerprints）。
+          mkdir -p "$HOME/.ssh"
+          cat > "$HOME/.ssh/known_hosts" <<'KNOWNHOSTS'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          KNOWNHOSTS
+          ssh-keygen -lf "$HOME/.ssh/known_hosts" || true
+
+          # remote 必须显式指向 SSH —— checkout 里 origin 是 https，
+          # 留着它会把 HTTPS 凭据和 deploy key 两套机制混在一起。
+          git remote set-url origin git@github.com:HunterXing/ZCode.git
+
+          # 用 GIT_SSH_COMMAND 而非写 ~/.ssh/config：命令级配置只作用于本步骤，
+          # 不会污染 runner 上后续步骤的 SSH 行为。
+          export GIT_SSH_COMMAND="ssh -i $KEY_PATH -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+
+          # 推送前自检：确认这把 key 真的有写权限，而不是走到一半才 403。
+          ssh -T -i "$KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$HOME/.ssh/known_hosts" git@github.com 2>&1 \
+            | grep -q "successfully authenticated" \
+            || { echo "::error::deploy key 认证失败"; exit 1; }
+          echo "  deploy key 认证通过"
+
           git push --force-with-lease origin main
           echo "  已推送，HEAD: $(git rev-parse --short HEAD)"
+
+          # 私钥用完即焚。runner 是临时的，但这步让"密钥在磁盘上存在的时间"
+          # 只覆盖本步骤本身，事故时的取证窗口也小得多。
+          rm -f "$KEY_PATH"
+          trap 'rm -f "$KEY_PATH"' EXIT
 
   # rebase 会改写 main，push 之后 build-desktop 靠 push 触发。
   # 但 rebase 后的 push 是 force-push，GitHub 对 force-push **默认也触发** push 事件，

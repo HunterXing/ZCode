@@ -67,18 +67,35 @@ Windows 签名同样受 `ZCODE_ENABLE_WINDOWS_SIGN=1` 门控。
 
 | Secret | 作用域 | 为什么需要 |
 | --- | --- | --- |
-| `ZCODE_SYNC_TOKEN` | 仅 `sync-upstream.yml` | 推送带 `workflow` scope 的 **classic PAT** |
+| `ZCODE_SSH_KEY_B64` | 仅 `sync-upstream.yml` | SSH deploy key 私钥（base64 单行） |
 
-**为什么不能用 `GITHUB_TOKEN`**：rebase 会把上游新增/修改的 `.github/workflows/*.yml`
+**为什么不用 `GITHUB_TOKEN`**：rebase 会把上游新增/修改的 `.github/workflows/*.yml`
 一并带进来，而 GitHub 硬性禁止 `GITHUB_TOKEN` 修改 workflow 文件（防 workflow 自我提权），
 push 会被拒：`remote rejected ... without 'workflows' permission`。
 这个限制**不是** `permissions:` 块能解决的 —— 官方 `GITHUB_TOKEN` 权限键里根本没有
 `workflows`（只有 actions / checks / contents / deployments 等十六个）。
 
-**建 PAT 的最小勾选**：`repo` + `workflow`。fine-grained PAT 不行，有一堆限制。
+**为什么用 deploy key 而不是 PAT**：classic PAT + `workflow` scope 同样可行，
+但需要人工在网页建 token，且到期后同步会**静默停止**（不报错，很难发现）。
+deploy key 没有到期概念、没有 scope 限制，也不经过 OAuth 体系，一次配置长期有效。
 
-**凭据传递方式**：走 `http.extraHeader`，**不塞进 remote URL**。公开仓库的 Actions 日志
-任何人可读，而 `git push` 失败时 git 会把 remote URL 原样打进错误信息 —— 塞 URL 等于公开 token。
+**deploy key 的换取与注册**（只做一次，私钥不要提交进仓库）：
+
+```bash
+ssh-keygen -t ed25519 -C "zcode-sync-deploykey" -N "" -f ~/.hermes/secrets/zcode-sync-ed25519
+gh api repos/HunterXing/ZCode/keys -X POST \
+  -f title="zcode-sync-ci" \
+  -f key="$(cat ~/.hermes/secrets/zcode-sync-ed25519.pub)" \
+  -F read_only=false
+gh secret set ZCODE_SSH_KEY_B64 -R HunterXing/ZCode \
+  --body "$(base64 -w0 ~/.hermes/secrets/zcode-sync-ed25519)"
+```
+
+`known_hosts` 里固定的是 GitHub 官方 ed25519 主机密钥，指纹必须与
+`gh api meta --jq .ssh_key_fingerprints.SHA256_ED25519` 一致
+（`SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`）。
+**不要用 `StrictHostKeyChecking=no`**：那等于关掉主机身份校验，
+一旦 DNS 或网络路径被劫持，私钥会被直接送到攻击者的服务器。
 
 ## 产物安装（未签名）
 
