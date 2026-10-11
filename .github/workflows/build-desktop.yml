@@ -176,7 +176,39 @@ jobs:
           # HUSKY=0：postinstall 里的 husky install 在无 git hooks 目录的 CI 上无意义且会告警。
           # 不加 --frozen-lockfile：上游 lockfile 偶有与 package.json 不同步的历史提交，
           # 锁死会让同步流水线因为一次上游提交直接失败。宁可用最新依赖重新解析。
-          HUSKY=0 pnpm install --no-frozen-lockfile
+          #
+          # 重试 3 次：packages/desktop 的 postinstall 会跑 node-pty-rebuild.mjs，
+          # 在非 Windows 平台**无条件**触发 electron-rebuild（decideNodePtyRebuild 对
+          # win32 以外的平台直接返回 shouldRebuild: true），而 node-gyp 的
+          # getNodeDir 阶段要联网下载 Electron headers。那是一次纯网络请求，
+          # GitHub 托管 runner 偶发超时就会让整个 job 挂在「安装依赖」，
+          # 与代码正确性无关（同一 commit 的 mac-arm64/linux 当轮就正常）。
+          # 2026-10-11 实测：node-gyp 报 "most likely ... related to network connectivity"，
+          # install.js:244 的 go() 抛出，随后 postinstall 以 255 退出。
+          #
+          # npm_config_disturl：node-gyp 只认这个变量来定位 Electron headers 源。
+          # 已有的 ELECTRON_MIRROR 指的是 electron/electron 的**发行包**
+          # （.../releases/download/），headers 在 electronjs.org/headers，
+          # 两者不是同一条路径 —— 这正是必须显式设 disturl 的原因。
+          for attempt in 1 2 3; do
+            echo "::group::pnpm install (第 $attempt/3 次)"
+            if HUSKY=0 \
+               npm_config_disturl=https://github.com/electron/electron/releases/download/ \
+               ELECTRON_MIRROR=https://github.com/electron/electron/releases/download/ \
+               pnpm install --no-frozen-lockfile; then
+              echo "::endgroup::"
+              echo "依赖安装成功"
+              break
+            fi
+            echo "::endgroup::"
+            if [ "$attempt" = 3 ]; then
+              echo "::error::依赖安装连续 3 次失败，放弃重试"
+              exit 1
+            fi
+            # 退避后重试：网络类失败几乎都是瞬时的，立刻重试往往还是同一波抖动
+            echo "::warning::第 $attempt 次安装失败，$((attempt * 20)) 秒后重试"
+            sleep $((attempt * 20))
+          done
 
       - name: 安装 Linux 打包依赖
         if: matrix.platform == 'Linux'
