@@ -1,0 +1,120 @@
+# 定时把 fork rebase 到上游 main。
+#
+# 为什么是 rebase 而不是 fast-forward：
+# fork 的 main 上有 2 个「只属于本 fork」的 commit（两个 workflow），
+# 它们**永远不可能出现在上游**，所以上游 main 永远不会是 fork HEAD 的祖先，
+# `git merge --ff-only upstream/main` 一旦上游前进就会失败。
+# 早期 deepseek-harness 那套用 `merge-base --is-ancestor HEAD upstream/main` 判空，
+# 方向恰好反了：上游一前进它就返回 false，workflow 判定「无新提交」而**静默跳过**，
+# run 仍显示 success —— 同步就此悄悄失效，且没有任何报错。这里方向写对。
+#
+# 为什么不会冲突：本地 commit 只触碰 2 个路径，上游一个都没有
+#   .github/workflows/sync-upstream.yml
+#   .github/workflows/build-desktop.yml
+# rebase 只是把它们原样重放到新上游之上，天然无冲突。
+# 万一上游真的新增了同名路径，rebase 会**响亮失败**，这正是我们要的。
+
+name: Sync upstream
+
+on:
+  schedule:
+    # 每天 04:23 UTC（北京时间 12:23）。避开整点，减少与上游发布撞车。
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  # 同步必须串行：两次 rebase 并发会互相抢 ref，第二个必然 --force-with-lease 失败。
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Rebase onto upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          # 必须完整历史：rebase 需要共同祖先，浅克隆会直接失败
+          fetch-depth: 0
+          # 不持久化 GITHUB_TOKEN：推送改用 ZCODE_SYNC_TOKEN（PAT），
+          # 留着 GITHUB_TOKEN 只会让凭据来源含混两可。
+          persist-credentials: false
+
+      - name: 挂载 upstream
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/zai-org/ZCode.git
+
+      - name: 拉取上游 main
+        run: git fetch --no-tags upstream main
+
+      - name: 判断上游是否前进
+        id: check
+        run: |
+          # 方向必须是「upstream/main 是否已在我的 HEAD 里」。
+          # 写反会导致上游一有更新就静默跳过（这是 deepseek-harness 上踩过的坑）。
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "  上游无新提交，fork 已是最新"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            BASE=$(git merge-base HEAD upstream/main)
+            N=$(git rev-list --count "$BASE"..upstream/main)
+            echo "  上游新增 $N 个 commit，将把本 fork 的 commit rebase 到其上"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: rebase
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git rebase upstream/main
+          echo "同步后 HEAD: $(git log --oneline -1)"
+          echo "本 fork 自己的 commit 数: $(git rev-list --count upstream/main..HEAD)"
+
+      - name: 校验 CI 文件仍在且工作树干净
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          for p in .github/workflows/sync-upstream.yml \
+                   .github/workflows/build-desktop.yml; do
+            [ -f "$p" ] || { echo "::error::rebase 后丢失 $p"; exit 1; }
+          done
+          [ -z "$(git status --porcelain)" ] || { echo "::error::工作树不干净"; git status --porcelain; exit 1; }
+          echo "  2 个 CI 文件完好，工作树干净"
+
+      - name: 推送
+        if: steps.check.outputs.changed == 'true'
+        # rebase 会重写历史，必须 force；但用 --force-with-lease，
+        # 若远端在我 fetch 之后被别人推过就拒绝，避免覆盖他人改动。
+        #
+        # 为什么必须用 PAT 而不是 GITHUB_TOKEN：
+        # rebase 会把上游新增/修改的 .github/workflows/*.yml 一并带进来，
+        # 而 GitHub 硬性禁止 GITHUB_TOKEN 修改 workflow 文件（防 workflow 自我提权），
+        # push 会被拒：remote rejected ... without `workflows` permission。
+        # 这个限制**不是** permissions 块能解决的 —— 官方 GITHUB_TOKEN 权限键里
+        # 根本没有 `workflows`（只有 actions/checks/contents/... 十六个）。
+        # 唯一可行做法是用带 workflow scope 的 classic PAT（secret: ZCODE_SYNC_TOKEN）。
+        run: |
+          set -euo pipefail
+          [ -n "${{ secrets.ZCODE_SYNC_TOKEN }}" ] || {
+            echo "::error::缺少 secret ZCODE_SYNC_TOKEN，无法推送 workflow 文件"; exit 1; }
+          # token 走 http.extraHeader 而**不是**塞进 remote URL：公开仓库的 Actions 日志
+          # 任何人可读，而 push 失败时 git 会把 remote URL 原样打进错误信息 ——
+          # 塞 URL 等于把 token 公开。extraHeader 不出现在任何 git 输出里。
+          git config http.https://github.com/.extraHeader \
+            "AUTHORIZATION: basic *** 'x-access-token:*** '${{ secrets.ZCODE_SYNC_TOKEN }}' | base64 -w0)"
+          trap 'git config --unset-all http.https://github.com/.extraHeader || true' EXIT
+          git push --force-with-lease origin main
+          echo "  已推送，HEAD: $(git rev-parse --short HEAD)"
+
+  # rebase 会改写 main，push 之后 build-desktop 靠 push 触发。
+  # 但 rebase 后的 push 是 force-push，GitHub 对 force-push **默认也触发** push 事件，
+  # 所以这里不需要额外调 build；如果将来发现没触发，用下面的 workflow_call 兜底。

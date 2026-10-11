@@ -1,0 +1,362 @@
+# 自建桌面产物流水线：补齐官方未发布的平台。
+#
+# 上游 zai-org/ZCode 的 v3.14.3 release 只带
+#   ZCode-3.14.3-mac-arm64.dmg
+#   ZCode-3.14.3-win-x64.exe
+# 缺 **macOS Intel (x64)** 与 **Linux**，本流水线专门补这两块缺口，
+# 同时把 arm64 / win-x64 也重建一份，保证四个目标来自同一 commit、同一份源码。
+#
+# 为什么**不需要**免签名补丁（与 deepseek-harness 那套的关键差异）：
+# 上游 electron-builder.config.js 已把签名/公证做成显式 opt-in：
+#   const shouldEnableMacSigning = process.env.ZCODE_ENABLE_MAC_SIGN === "1" && Boolean(macSigningIdentity);
+#   mac: { identity: shouldEnableMacSigning ? macSigningIdentity : null,
+#          notarize: false,            // 硬编码关闭，不读任何 Apple 凭据
+#          hardenedRuntime: shouldEnableMacSigning }
+# Windows 签名同样受 ZCODE_ENABLE_WINDOWS_SIGN=1 门控。
+# 于是「不设这两个变量」= 官方支持的免签名路径，不需要 git apply 任何补丁，
+# 工作树永远干净，sync-upstream 的 rebase 也永远不会因为构建期改动而失败。
+# 签名凭据一旦具备，配成 repository secrets 并打开对应开关即可切回官方签名流程。
+#
+# 免签名产物的使用（与官方未公证包一致）：
+#   macOS  首次打开需 右键 → 打开 绕过 Gatekeeper
+#   Windows SmartScreen 需 点「更多信息 → 仍要运行」
+#   Linux   AppImage 直接 chmod +x 运行；deb/rpm/pacman 用对应包管理器安装
+
+name: Build desktop artifacts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 公开仓库的 GitHub 托管 runner 免费且不限量；改私有会开始计费，
+# 且 macOS runner 按 10 倍分钟倍率计算。
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-build
+  # true：新 push 立即掐掉上一次未完成的构建。
+  # 宁可重跑，也不要产出一个缺平台/半成品的包。
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    # macos-15-intel 是原生 x64 runner（4 vCPU / 14GB）；macos-15 是原生 arm64（3 vCPU / 7GB）。
+    # label 取值已对照 actions/runner-images 的 Available Images 核实。
+    # 必须在原生 runner 上构建对应架构：electron-builder 的 mac 交叉编译不可靠，
+    # 且 dmg 制作与 codesign 都是架构相关操作。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: mac-x64
+            os: macos-15-intel
+            platform: macOS
+          - target: mac-arm64
+            os: macos-15
+            platform: macOS
+          - target: win-x64
+            os: windows-2022
+            platform: Windows
+          - target: linux-x64
+            os: ubuntu-24.04
+            platform: Linux
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    # 注意：这里**不能**加 job 级 if 来筛选目标。GitHub 在矩阵展开**之前**求值
+    # jobs.<id>.if，matrix 上下文尚不存在，会报 Unrecognized named-value: 'matrix'。
+    # 需要按目标筛选只能在 step 级做（那里 matrix 可用）。
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 浅历史足够：构建只需要 HEAD。完整历史是 sync-upstream 的需求，不是构建的。
+          # 注意：不需要 submodules —— 上游没有 .gitmodules，apps/zcode-cli 是普通目录。
+          # （scripts/bootstrap.mjs 里的 `git submodule update` 对本仓库是空操作。）
+          fetch-depth: 1
+
+      # pnpm/action-setup 会读取根 package.json 的 packageManager 字段（pnpm@10.33.2），
+      # 必须在 setup-node 之前：setup-node 的 cache: pnpm 依赖 PATH 里已有 pnpm。
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          # 上游 mise.toml 钉 node 24.14.0，package.json engines 要求 >=24.0.0
+          node-version: '24.14.0'
+          cache: pnpm
+
+      - name: 记录 runner 规格与磁盘余量
+        shell: bash
+        run: |
+          echo "### Runner 规格" >> "$GITHUB_STEP_SUMMARY"
+          echo "- label: \`${{ matrix.os }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 目标: \`${{ matrix.target }}\`" >> "$GITHUB_STEP_SUMMARY"
+          node -e 'const os=require("os");console.log(`- 环境: \`${process.version}\` / ${os.platform()} ${os.arch()} / ${os.cpus().length} vCPU / ${(os.totalmem()/2**30).toFixed(1)}GB RAM`)' >> "$GITHUB_STEP_SUMMARY"
+          df -h . 2>/dev/null | tail -1 | awk '{print "- 工作盘可用: **"$4"** (总计 "$2")"}' >> "$GITHUB_STEP_SUMMARY" || echo "- 磁盘信息不可用" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 安装依赖
+        shell: bash
+        run: |
+          # 只跑 pnpm install，**不跑 pnpm bootstrap**：
+          # bootstrap 会额外执行 build:bootstrap（全 workspace 构建 + prepare:desktop-runtime），
+          # 而 bundle:desktop 自己就会跑 desktop 的 prepare:runtime-assets + build。
+          # 这里再跑一遍纯属浪费 10+ 分钟 runner 时间。
+          #
+          # HUSKY=0：postinstall 里的 husky install 在无 git hooks 目录的 CI 上无意义且会告警。
+          # 不加 --frozen-lockfile：上游 lockfile 偶有与 package.json 不同步的历史提交，
+          # 锁死会让同步流水线因为一次上游提交直接失败。宁可用最新依赖重新解析。
+          HUSKY=0 pnpm install --no-frozen-lockfile
+
+      - name: 安装 Linux 打包依赖
+        if: matrix.platform == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 上游 linux target = ["AppImage", "deb", "rpm", "pacman"]，四个都要产出。
+          # AppImage / deb 靠 electron-builder 内置 app-builder 处理，runner 自带工具即可。
+          # rpm / pacman 走 fpm（app-builder-lib/out/targets/FpmTarget.js: executeFpm），
+          # 源码里的错误提示明确列出两个外部依赖：
+          #   "Need executable 'rpmbuild' to convert dir to rpm"  → 缺 rpm 包
+          #   "xz: not found"                                    → 缺 xz-utils 包
+          # （rpm 与 pacman 共用 --*-compression，默认 xz，所以两个 target 都要 xz。）
+          # 官方 runner 镜像不预装这两者，不显式装会在打包阶段才报错。
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends rpm xz-utils
+          command -v rpmbuild >/dev/null || { echo "::error::rpmbuild 仍不可用，rpm 目标会失败"; exit 1; }
+          command -v xz       >/dev/null || { echo "::error::xz 仍不可用，rpm/pacman 目标会失败"; exit 1; }
+          echo "rpmbuild: $(rpmbuild --version 2>&1 | head -1)"
+          echo "xz: $(xz --version 2>&1 | head -1)"
+
+      - name: 校验目标架构
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            mac-x64)   EXPECT=darwin;  EXPECT_ARCH=x64  ;;
+            mac-arm64) EXPECT=darwin;  EXPECT_ARCH=arm64 ;;
+            win-x64)   EXPECT=win32;   EXPECT_ARCH=x64  ;;
+            linux-x64) EXPECT=linux;   EXPECT_ARCH=x64  ;;
+            *) echo "::error::未知目标"; exit 1 ;;
+          esac
+          ACTUAL=$(node -p 'process.platform')
+          ACTUAL_ARCH=$(node -p 'process.arch')
+          if [ "$ACTUAL" != "$EXPECT" ] || [ "$ACTUAL_ARCH" != "$EXPECT_ARCH" ]; then
+            echo "::error::runner 架构不符：期望 $EXPECT/$EXPECT_ARCH，实际 $ACTUAL/$ACTUAL_ARCH"
+            exit 1
+          fi
+          echo "runner 架构校验通过：$ACTUAL/$ACTUAL_ARCH"
+
+      - name: 打包 ${{ matrix.target }}
+        shell: bash
+        env:
+          # 生产身份：ZCODE_ENV=production 决定 productName=ZCode + appId=dev.zcode.app，
+          # 并让 electron-builder 读取 config/provider/zcode-builtin.json（生产后端配置）。
+          # 不设它会退化成 Preview 身份 + 测试后端配置，产出一个连不上正式服务的包。
+          ZCODE_ENV: production
+          # 显式关闭签名/公证（上游默认就是关的，这里写出来是为了让意图可读，
+          # 且防止将来上游改变默认值时我们被静默带进需要 Apple 凭据的分支）。
+          ZCODE_ENABLE_MAC_SIGN: '0'
+          ZCODE_ENABLE_WINDOWS_SIGN: '0'
+          # 上游 mise.toml 给的是 npmmirror（国内源）。GitHub 托管 runner 在美国，
+          # 走国内源会绕远甚至超时，这里覆盖成官方源。
+          ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+        run: |
+          set -euo pipefail
+          # bundle.mjs 接位置参数 os arch（或 --os/--arch），内部依次跑
+          #   prepare:runtime-assets → build → electron-builder → 产物校验 → 体积审计
+          # electron-builder 不加 --publish：产物统一由后面的 upload-artifact 收走，
+          # 避免每个 job 各自发一遍 Release。
+          case "${{ matrix.target }}" in
+            mac-x64)   pnpm run bundle:desktop -- mac x64   ;;
+            mac-arm64) pnpm run bundle:desktop -- mac arm64 ;;
+            win-x64)   pnpm run bundle:desktop -- win x64   ;;
+            linux-x64) pnpm run bundle:desktop -- linux x64 ;;
+            *) echo "::error::未知目标"; exit 1 ;;
+          esac
+
+      - name: 收集产物（macOS）
+        if: matrix.platform == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 产物名由 electron-builder.config.js 的 artifactName 决定：
+          #   ${productName}-${version}-${platformName}-${arch}.${ext}
+          # 例如 ZCode-3.15.1-mac-x64.dmg / .zip
+          mkdir -p out
+          shopt -s nullglob
+          DMG=(packages/desktop/dist/*-mac-*.dmg)
+          ZIP=(packages/desktop/dist/*-mac-*.zip)
+          if [ ${#DMG[@]} -eq 0 ]; then
+            echo "::error::未找到 mac DMG 产物"; ls -la packages/desktop/dist/ || true; exit 1
+          fi
+          echo "DMG 产物："
+          for f in "${DMG[@]}"; do printf '  %s (%s)\n' "$f" "$(du -sh "$f" | cut -f1)"; done
+          # zip 是 electron-updater 的差分更新格式（blockmap 已在其中），
+          # 一并发布，将来开 OTA 时可直接用。
+          if [ ${#ZIP[@]} -gt 0 ]; then
+            echo "ZIP 产物："
+            for f in "${ZIP[@]}"; do printf '  %s (%s)\n' "$f" "$(du -sh "$f" | cut -f1)"; done
+          fi
+          # 断言产物架构与矩阵目标一致。
+          # mac 的 ${arch} 段在 electron-builder 里展开为 x64 / arm64；
+          # 装错架构的 .dmg 在用户机器上「双击没反应」或提示无法打开，最难事后排查。
+          # 用显式 case 而非 `${{ a && 'x' || 'y' }}`：后者在 Actions 表达式里
+          # 依赖「真值非假」的隐式规则，可读性差且容易在后续改动中写错。
+          case "${{ matrix.target }}" in
+            mac-x64)   EXPECT_ARCH_NAME=x64  ;;
+            mac-arm64) EXPECT_ARCH_NAME=arm64 ;;
+            *) echo "::error::未知目标"; exit 1 ;;
+          esac
+          for f in "${DMG[@]}" ${ZIP[@]+"${ZIP[@]}"}; do
+            case "$f" in
+              *-mac-"$EXPECT_ARCH_NAME".dmg|*-mac-"$EXPECT_ARCH_NAME".zip) ;;
+              *) echo "::error::产物架构不符（期望 -mac-$EXPECT_ARCH_NAME.*）：$f"; exit 1 ;;
+            esac
+          done
+          cp "${DMG[@]}" out/
+          [ ${#ZIP[@]} -eq 0 ] || cp "${ZIP[@]}" out/
+          ls -la out/
+
+      - name: 收集产物（Windows）
+        if: matrix.platform == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          shopt -s nullglob
+          # 产物名形如 ZCode-3.15.1-win-x64.exe
+          EXE=(packages/desktop/dist/*-win-*.exe)
+          if [ ${#EXE[@]} -eq 0 ]; then
+            echo "::error::未找到 Windows EXE 产物"; ls -la packages/desktop/dist/ || true; exit 1
+          fi
+          # 顺带断言架构：产物名里的 arch 段必须与矩阵目标一致。
+          # NSIS 装错架构的包在用户机器上会静默装不上（"应用无法在这台电脑运行"），
+          # 属于最难在事后发现的一类问题，必须在发布前拦住。
+          for f in "${EXE[@]}"; do
+            case "$f" in
+              *-win-x64.exe) ;;
+              *) echo "::error::产物架构不符（期望 -win-x64.exe）：$f"; exit 1 ;;
+            esac
+          done
+          cp "${EXE[@]}" out/
+          ls -la out/
+
+      - name: 收集产物（Linux）
+        if: matrix.platform == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          shopt -s nullglob
+          # 上游 linux target = ["AppImage", "deb", "rpm", "pacman"]
+          # 一次构建出四种包，全部收走（总共约 200MB，一次性成本可接受）。
+          FOUND=0
+          for pattern in '*-linux-*.AppImage' '*-linux-*.deb' '*-linux-*.rpm' '*-linux-*.pkg.tar.zst'; do
+            MATCHES=(packages/desktop/dist/$pattern)
+            if [ ${#MATCHES[@]} -gt 0 ]; then
+              FOUND=$((FOUND + ${#MATCHES[@]}))
+              printf '  %s (%s)\n' "${MATCHES[@]}" "$(du -sh "${MATCHES[@]}" | cut -f1 | paste -sd' ')"
+              cp "${MATCHES[@]}" out/
+            fi
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::error::未找到任何 Linux 产物"; ls -la packages/desktop/dist/ || true; exit 1
+          fi
+          echo "共收集 $FOUND 个 Linux 包"
+          ls -la out/
+
+      - name: 产物版本自检
+        shell: bash
+        run: |
+          set -euo pipefail
+          # extraMetadata.version 来自仓库 package.json 的 version，
+          # 发布出去的产物必须带着与源码一致的版本，否则客户端永远提示「有新版」。
+          EXPECT=$(node -p "require('./package.json').version")
+          echo "仓库声明版本: $EXPECT"
+          ls -1 out/
+          # 文件名里必须含版本号。electron-updater 靠把 URL 里的新版本号替换成旧版本号
+          # 来定位上一版的 blockmap，名字里没有版本号差分就退化成全量下载。
+          BAD=$(ls -1 out/ | grep -v "$EXPECT" || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::以下产物文件名不含版本号 $EXPECT，发布后差分更新会退化为全量下载："
+            echo "$BAD"
+            exit 1
+          fi
+          echo "产物版本自检通过"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zcode-${{ matrix.target }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 构建后磁盘用量
+        if: always()
+        shell: bash
+        run: df -h . 2>/dev/null | tail -1 | awk '{print "工作盘已用 "$3" / "$2"  可用 "$4}' | tee -a "$GITHUB_STEP_SUMMARY" || echo "磁盘信息不可用" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # 产物默认只落在 Actions artifact（30 天过期、藏在 run 页面里），
+  # 这里再发一份到 Releases：有稳定 URL、可长期保留、其他机器/脚本能直接引用。
+  publish-release:
+    name: 发布四个平台
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: 下载四个平台的产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zcode-*
+          merge-multiple: true
+          path: dist
+
+      - name: 读取构建版本与待发布文件
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 版本从产物文件名反推，而不是从仓库 package.json：
+          # 后者只是 productVersion，发布出去的 Release 标题会长期显示一个比产物旧的版本。
+          NAME=$(ls -1 dist/ | head -1)
+          if [ -z "$NAME" ]; then
+            echo "::error::没有下载到任何产物"; exit 1
+          fi
+          VER=$(echo "$NAME" | sed -n 's/^ZCode-\([0-9][^-]*\)-.*/\1/p')
+          if [ -z "$VER" ]; then
+            echo "::error::无法从产物文件名解析版本：$NAME"; exit 1
+          fi
+          echo "构建版本: $VER"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "待发布文件："; ls -la dist/
+
+      - name: 创建 / 覆盖 Release ci-latest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-latest
+          name: ZCode ${{ steps.meta.outputs.version }} (四平台自建)
+          body: |
+            由 `build-desktop.yml` 自动构建并覆盖发布，源码同步自 [zai-org/ZCode](https://github.com/zai-org/ZCode)。
+
+            - 构建 commit：`${{ github.sha }}`
+            - 运行时版本：`${{ steps.meta.outputs.version }}`
+            - 触发方式：每天定时同步上游后自动重建
+
+            **补齐了官方未发布的平台**：官方 release 只有 `mac-arm64.dmg` 与 `win-x64.exe`，
+            本构建额外提供 **macOS Intel (x64)** 与 **Linux**（AppImage / deb / rpm / pacman）。
+
+            **产物未签名、未公证。**
+            - macOS：首次打开需 右键 → 打开 绕过 Gatekeeper；不会出现在「系统设置 → 隐私与安全性」里。
+            - Windows：SmartScreen 弹窗点「更多信息 → 仍要运行」。
+            - Linux：AppImage `chmod +x` 后直接运行；deb/rpm/pacman 用对应包管理器安装。
+          files: dist/*
+          fail_on_unmatched_files: true
+          overwrite_files: true
