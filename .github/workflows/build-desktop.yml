@@ -71,30 +71,31 @@ jobs:
     # 需要按目标筛选只能在 step 级做（那里 matrix 可用）。
 
     steps:
+      # Windows runner 的 Git for Windows 默认 core.autocrlf=true，会把工作区所有文本文件
+      # 的 LF 转成 CRLF。上游 .gitattributes 只给 *.mjs / *.sh 强制了 eol=lf，
+      # **.js 与 .min.js 没有规则**，于是 Windows 上 checkout 出来的 vendor 文件字节与仓库不同。
+      # 而 packages/desktop/scripts/gen-ui-runtime-assets.mjs 会对这些文件做 sha256 校验
+      # （"Gen UI vendor hash mismatch: floating-ui-core-1.7.3.min.js"），直接构建失败。
+      #
+      # 关键：这一段必须排在 actions/checkout **之前**。checkout 完成后文件已经落盘，
+      # 再设 core.autocrlf 已经太晚（实测：在 checkout 之后关转换，校验依然失败）。
+      # actions/checkout 内部调用的就是 PATH 里的 git，会读全局配置，所以 --global 有效。
+      - name: 关闭行尾转换（仅 Windows，须在 checkout 之前）
+        if: matrix.platform == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          echo "core.autocrlf=$(git config --global core.autocrlf)"
+          echo "core.eol=$(git config --global core.eol)"
+
       - uses: actions/checkout@v5
         with:
           # 浅历史足够：构建只需要 HEAD。完整历史是 sync-upstream 的需求，不是构建的。
           # 注意：不需要 submodules —— 上游没有 .gitmodules，apps/zcode-cli 是普通目录。
           # （scripts/bootstrap.mjs 里的 `git submodule update` 对本仓库是空操作。）
           fetch-depth: 1
-
-      # Windows runner 的 Git for Windows 默认 core.autocrlf=true，会把工作区所有文本文件
-      # 的 LF 转成 CRLF。上游 .gitattributes 只给 *.mjs / *.sh 强制了 eol=lf，
-      # **.js 与 .min.js 没有规则**，于是 Windows 上 checkout 出来的 vendor 文件字节与仓库不同。
-      # 而 packages/desktop/scripts/gen-ui-runtime-assets.mjs 会对这些文件做 sha256 校验
-      # （"Gen UI vendor hash mismatch: floating-ui-core-1.7.3.min.js"），直接构建失败。
-      # 根治办法是 checkout 时关掉转换：仓库内容按原样落盘，任何 sha256 校验都不会漂移。
-      - name: 关闭行尾转换（仅 Windows）
-        if: matrix.platform == 'Windows'
-        shell: bash
-        run: |
-          # 对当前仓库所有路径取消 CRLF 转换。core.autocrlf=false 必须在 checkout 之前生效才有效，
-          # 所以这里同时用 config --global 兜住后续可能重新 checkout 的情况。
-          git config --global core.autocrlf false
-          git config core.autocrlf false
-          git config --global core.eol lf
-          echo "core.autocrlf=$(git config core.autocrlf)"
-          echo "core.eol=$(git config core.eol)"
 
       - name: 校验 vendor 资源未被行尾转换污染
         if: matrix.platform == 'Windows'
@@ -168,6 +169,13 @@ jobs:
           # bsdtar —— **源码的报错提示里没有它**，是 pacman target 生成 .mtree 时才炸的
           #   （LANG=C bsdtar -czf .MTREE --format=mtree ... → exit 127）
           #   上游 CI 是内网私有的，这个依赖不会体现在任何公开文档或错误提示里。
+          #   注意：Debian/Ubuntu **没有叫 bsdtar 的包**，可执行文件由 libarchive-tools 提供
+          #   （apt-cache search bsdtar 只会列出 libarchive-tools / mtree-netbsd / node-tar）。
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends rpm xz-utils libarchive-tools
+          # rpmbuild —— FpmTarget.js:executeFpm 的报错提示明写
+          #   "Need executable 'rpmbuild' to convert dir to rpm"
+          # xz —— 同处提示 "xz: not found"；rpm 与 pacman 共用 --*-compression，默认 xz
           for bin in rpmbuild xz bsdtar; do
             command -v "$bin" >/dev/null || { echo "::error::$bin 仍不可用，对应打包目标会失败"; exit 1; }
           done
