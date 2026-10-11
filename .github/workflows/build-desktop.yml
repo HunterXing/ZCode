@@ -108,23 +108,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git ls-tree -r -z --name-only HEAD > /tmp/zcode-paths.z
-          node -e '
-            const fs = require("node:fs");
-            const raw = fs.readFileSync("/tmp/zcode-paths.z");
-            const bad = [];
-            for (const p of raw.toString("utf8").split("\0")) {
-              if (!p) continue;
-              if (/[<>:"|?*\u0000-\u001f]/.test(p)) bad.push("含 Windows 禁用字符: " + JSON.stringify(p));
-              else if (/[ .]$/.test(p)) bad.push("以空格或句点结尾: " + JSON.stringify(p));
-            }
-            if (bad.length) {
-              console.error("::error::仓库含 Windows 无法检出的路径（会导致 win-x64 在 checkout 阶段失败）：");
-              for (const b of bad.slice(0, 20)) console.error("  " + b);
-              if (bad.length > 20) console.error(`  ...另有 ${bad.length - 20} 条`);
-              process.exit(1);
-            }
-            console.log("路径校验通过：全部文件均可被 Windows 检出");
+          # 用管道而不是临时文件：Git Bash 会把 /tmp 映射到
+          # %LOCALAPPDATA%\Temp，而 node.exe 收到字面量 /tmp/... 会解析成
+          # 当前盘符下的 \tmp\（如 D:\tmp\），目录不存在直接 ENOENT。
+          # 2026-10-11 实测踩过这个坑，守卫自己把 win-x64 弄挂了。
+          git ls-tree -r -z --name-only HEAD | node -e '
+            const chunks = [];
+            process.stdin.on("data", (c) => chunks.push(c));
+            process.stdin.on("end", () => {
+              const raw = Buffer.concat(chunks).toString("utf8");
+              const bad = [];
+              for (const p of raw.split("\0")) {
+                if (!p) continue;
+                if (/[<>:"|?*\u0000-\u001f]/.test(p)) bad.push("含 Windows 禁用字符: " + JSON.stringify(p));
+                else if (/[ .]$/.test(p)) bad.push("以空格或句点结尾: " + JSON.stringify(p));
+              }
+              if (bad.length) {
+                console.error("::error::仓库含 Windows 无法检出的路径（会导致 win-x64 在 checkout 阶段失败）：");
+                for (const b of bad.slice(0, 20)) console.error("  " + b);
+                if (bad.length > 20) console.error(`  ...另有 ${bad.length - 20} 条`);
+                process.exit(1);
+              }
+              console.log("路径校验通过：全部文件均可被 Windows 检出");
+            });
           '
 
       - name: 校验 vendor 资源未被行尾转换污染
