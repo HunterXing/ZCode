@@ -204,8 +204,8 @@ jobs:
           # 断言产物架构与矩阵目标一致。
           # mac 的 ${arch} 段在 electron-builder 里展开为 x64 / arm64；
           # 装错架构的 .dmg 在用户机器上「双击没反应」或提示无法打开，最难事后排查。
-          # 用显式 case 而非 `${{ a && 'x' || 'y' }}`：后者在 Actions 表达式里
-          # 依赖「真值非假」的隐式规则，可读性差且容易在后续改动中写错。
+          # 用显式 case 分派，不在 Actions 表达式里做三元：
+          # 后者依赖「真值非假」的隐式规则，可读性差且容易在后续改动中写错。
           case "${{ matrix.target }}" in
             mac-x64)   EXPECT_ARCH_NAME=x64  ;;
             mac-arm64) EXPECT_ARCH_NAME=arm64 ;;
