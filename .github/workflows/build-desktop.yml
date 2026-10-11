@@ -155,27 +155,19 @@ jobs:
           set -euo pipefail
           # 上游 linux target = ["AppImage", "deb", "rpm", "pacman"]，四个都要产出。
           # AppImage / deb 靠 electron-builder 内置 app-builder 处理，runner 自带工具即可。
-          # rpm / pacman 走 fpm（app-builder-lib/out/targets/FpmTarget.js: executeFpm），
-          # 源码里的错误提示明确列出两个外部依赖：
-          #   "Need executable 'rpmbuild' to convert dir to rpm"  → 缺 rpm 包
-          #   "xz: not found"                                    → 缺 xz-utils 包
-          # （rpm 与 pacman 共用 --*-compression，默认 xz，所以两个 target 都要 xz。）
-          # 官方 runner 镜像不预装这两者，不显式装会在打包阶段才报错。
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends rpm xz-utils bsdtar
-          # rpmbuild —— FpmTarget.js:executeFpm 的报错提示明写
-          #   "Need executable 'rpmbuild' to convert dir to rpm"
-          # xz —— 同处提示 "xz: not found"；rpm 与 pacman 共用 --*-compression，默认 xz
-          # bsdtar —— **源码的报错提示里没有它**，是 pacman target 生成 .mtree 时才炸的
-          #   （LANG=C bsdtar -czf .MTREE --format=mtree ... → exit 127）
-          #   上游 CI 是内网私有的，这个依赖不会体现在任何公开文档或错误提示里。
-          #   注意：Debian/Ubuntu **没有叫 bsdtar 的包**，可执行文件由 libarchive-tools 提供
-          #   （apt-cache search bsdtar 只会列出 libarchive-tools / mtree-netbsd / node-tar）。
+          # rpm / pacman 走 fpm（app-builder-lib/out/targets/FpmTarget.js: executeFpm）：
+          #   rpmbuild —— 该函数的报错提示明写 "Need executable 'rpmbuild' to convert dir to rpm"
+          #   xz       —— 同处提示 "xz: not found"；rpm 与 pacman 共用 --*-compression，默认 xz
+          #   bsdtar   —— **报错提示里没有它**，是 pacman target 生成 .mtree 时才炸的
+          #               （LANG=C bsdtar -czf .MTREE --format=mtree ... → exit 127）
+          #               上游 CI 是内网私有的，这个依赖不体现在任何公开文档或错误提示里。
+          #               Debian/Ubuntu **没有叫 bsdtar 的包**，可执行文件由 libarchive-tools 提供
+          #               （apt-cache search bsdtar 只列 libarchive-tools / mtree-netbsd / node-tar）。
+          # 官方 runner 镜像不预装这三者，不显式装会在打包阶段才报错。
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends rpm xz-utils libarchive-tools
-          # rpmbuild —— FpmTarget.js:executeFpm 的报错提示明写
-          #   "Need executable 'rpmbuild' to convert dir to rpm"
-          # xz —— 同处提示 "xz: not found"；rpm 与 pacman 共用 --*-compression，默认 xz
+          # 装完立刻断言：缺哪个就在依赖步骤直接失败，
+          # 而不是拖 10 分钟后在打包阶段炸出一个难读的 exit 127。
           for bin in rpmbuild xz bsdtar; do
             command -v "$bin" >/dev/null || { echo "::error::$bin 仍不可用，对应打包目标会失败"; exit 1; }
           done
