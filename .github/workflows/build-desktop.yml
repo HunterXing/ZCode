@@ -78,6 +78,43 @@ jobs:
           # （scripts/bootstrap.mjs 里的 `git submodule update` 对本仓库是空操作。）
           fetch-depth: 1
 
+      # Windows runner 的 Git for Windows 默认 core.autocrlf=true，会把工作区所有文本文件
+      # 的 LF 转成 CRLF。上游 .gitattributes 只给 *.mjs / *.sh 强制了 eol=lf，
+      # **.js 与 .min.js 没有规则**，于是 Windows 上 checkout 出来的 vendor 文件字节与仓库不同。
+      # 而 packages/desktop/scripts/gen-ui-runtime-assets.mjs 会对这些文件做 sha256 校验
+      # （"Gen UI vendor hash mismatch: floating-ui-core-1.7.3.min.js"），直接构建失败。
+      # 根治办法是 checkout 时关掉转换：仓库内容按原样落盘，任何 sha256 校验都不会漂移。
+      - name: 关闭行尾转换（仅 Windows）
+        if: matrix.platform == 'Windows'
+        shell: bash
+        run: |
+          # 对当前仓库所有路径取消 CRLF 转换。core.autocrlf=false 必须在 checkout 之前生效才有效，
+          # 所以这里同时用 config --global 兜住后续可能重新 checkout 的情况。
+          git config --global core.autocrlf false
+          git config core.autocrlf false
+          git config --global core.eol lf
+          echo "core.autocrlf=$(git config core.autocrlf)"
+          echo "core.eol=$(git config core.eol)"
+
+      - name: 校验 vendor 资源未被行尾转换污染
+        if: matrix.platform == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 直接跑上游自己的校验逻辑，而不是复刻一遍 sha256 比对：
+          # 逻辑只有一份，脚本改了这里自动跟着改。
+          node -e '
+            import("./packages/desktop/scripts/gen-ui-runtime-assets.mjs")
+              .then(async (m) => {
+                const os = await import("node:os");
+                const path = await import("node:path");
+                const dest = path.join(os.tmpdir(), "gen-ui-verify");
+                await m.copyGenUiRuntimeAssets(dest);
+                console.log("vendor 资源校验通过，无 CRLF 污染");
+              })
+              .catch((e) => { console.error("::error::" + e.message); process.exit(1); });
+          '
+
       # pnpm/action-setup 会读取根 package.json 的 packageManager 字段（pnpm@10.33.2），
       # 必须在 setup-node 之前：setup-node 的 cache: pnpm 依赖 PATH 里已有 pnpm。
       - uses: pnpm/action-setup@v4
@@ -124,11 +161,19 @@ jobs:
           # （rpm 与 pacman 共用 --*-compression，默认 xz，所以两个 target 都要 xz。）
           # 官方 runner 镜像不预装这两者，不显式装会在打包阶段才报错。
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends rpm xz-utils
-          command -v rpmbuild >/dev/null || { echo "::error::rpmbuild 仍不可用，rpm 目标会失败"; exit 1; }
-          command -v xz       >/dev/null || { echo "::error::xz 仍不可用，rpm/pacman 目标会失败"; exit 1; }
+          sudo apt-get install -y --no-install-recommends rpm xz-utils bsdtar
+          # rpmbuild —— FpmTarget.js:executeFpm 的报错提示明写
+          #   "Need executable 'rpmbuild' to convert dir to rpm"
+          # xz —— 同处提示 "xz: not found"；rpm 与 pacman 共用 --*-compression，默认 xz
+          # bsdtar —— **源码的报错提示里没有它**，是 pacman target 生成 .mtree 时才炸的
+          #   （LANG=C bsdtar -czf .MTREE --format=mtree ... → exit 127）
+          #   上游 CI 是内网私有的，这个依赖不会体现在任何公开文档或错误提示里。
+          for bin in rpmbuild xz bsdtar; do
+            command -v "$bin" >/dev/null || { echo "::error::$bin 仍不可用，对应打包目标会失败"; exit 1; }
+          done
           echo "rpmbuild: $(rpmbuild --version 2>&1 | head -1)"
           echo "xz: $(xz --version 2>&1 | head -1)"
+          echo "bsdtar: $(bsdtar --version 2>&1 | head -1)"
 
       - name: 校验目标架构
         shell: bash
