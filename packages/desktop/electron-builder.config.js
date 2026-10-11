@@ -935,8 +935,10 @@ export default {
     // electron-updater 会因缺少 multipart/byteranges 直接回退整包下载。关闭 multiple range 后仍走差分，
     // 只是按单 Range 顺序拉取差异块，避免 Windows 用户更新时从约 15MB 退化成 300MB+ 全量包。
     useMultipleRangeRequest: false,
-    // 新客户端运行时使用服务端 manifest provider；这里仅保留 electron-builder 必需的
-    // generic publish 占位，避免打包产物继续携带可配置的旧 stable feed。
-    url: "http://localhost:8081",
+    // fork 自建包：更新源指向本仓库的 GitHub Release（tag 固定 ci-latest，每次构建覆盖，
+    // 因此 feed 地址稳定）。CI 会在同一 Release 里发布 electron-updater 原生清单
+    // （latest-mac.yml / latest.yml / latest-linux.yml），客户端据此检查并下载新版。
+    url: "https://github.com/HunterXing/ZCode/releases/download/ci-latest/",
+    channel: "latest",
   },
 };

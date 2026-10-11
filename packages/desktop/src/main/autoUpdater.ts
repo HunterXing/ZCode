@@ -27,6 +27,27 @@ const AUTO_UPDATE_POLL_INTERVAL_MS = 15 * 60 * 1000;
 const AUTO_UPDATE_VISIBLE_POLL_INTERVAL_MS = 2 * 60 * 1000;
 const UPDATE_FEED_URL_ENV = "ZCODE_UPDATE_FEED_URL";
 const UPDATE_FEED_URL_SWITCH = "--zcode-update-feed-url";
+
+/**
+ * 判断更新源是否为自建（fork）包自己的静态托管地址。
+ *
+ * 官方包的 feed 是自家后端的 manifest 接口（`/api/v1/releases/electron/manifest`）；
+ * 自建包把 feed 指到自己的 GitHub Release 之类静态托管时，返回的是
+ * electron-updater 原生清单（latest-mac.yml / latest.yml），与 manifest 接口不是一回事，
+ * 必须切到原生 provider，否则客户端会一直 404。
+ *
+ * 判据是「URL 路径是不是官方 manifest 接口」，而不是「origin 是不是官方」——
+ * 上游测试明确要求非官方 origin 的 manifest 接口仍走 custom provider
+ * （见 test/autoUpdaterReadyState.test.ts「manifest URL 覆盖不会切换到 generic feed」），
+ * 所以只认路径特征，不认 origin。
+ */
+function isSelfHostedStaticFeed(feedUrl: string | undefined): boolean {
+  if (!feedUrl) {
+    return false;
+  }
+  const path = feedUrl.trim().replace(/[?#].*$/, "");
+  return !path.endsWith("/api/v1/releases/electron/manifest");
+}
 const DEV_AUTO_UPDATE_ENV = "ZCODE_AUTO_UPDATE_DEV";
 const DEV_AUTO_UPDATE_SWITCH = "--zcode-auto-update-dev";
 const DEV_AUTO_UPDATE_VERSION_ENV = "ZCODE_AUTO_UPDATE_DEV_VERSION";
@@ -782,6 +803,18 @@ async function syncAutoUpdateCheckChannelFromSettings(
 
 function applyManifestUpdateProvider(options: InitAutoUpdaterOptions): void {
   const manifestUrl = options.updateFeedSource?.url.trim();
+  // fork 自建包：把更新源指向自己的 GitHub Release 时，不能再用官方后端 manifest
+  // provider —— 它请求的是 /api/v1/releases/electron/manifest 这个私有 REST 接口，
+  // 与自建产物的 electron-updater 清单（latest-mac.yml 等）不是一回事。
+  // 此时回退到 electron-updater 原生 provider，让它去读 app-update.yml 里的
+  // publish.url（构建期已指向 GitHub Release）。
+  if (isSelfHostedStaticFeed(manifestUrl)) {
+    autoUpdater.setFeedURL({ provider: "generic" });
+    logger.info(
+      `[auto-update] self-hosted feed provider applied platform=${getElectronReleasePlatform()} feed=${redactUpdateFeedUrlForLog(manifestUrl!)}`,
+    );
+    return;
+  }
   autoUpdater.setFeedURL({
     provider: "custom",
     updateProvider: ManifestUpdateProvider,

@@ -205,6 +205,14 @@ jobs:
           # 且防止将来上游改变默认值时我们被静默带进需要 Apple 凭据的分支）。
           ZCODE_ENABLE_MAC_SIGN: '0'
           ZCODE_ENABLE_WINDOWS_SIGN: '0'
+          # 打开应用内自动更新。默认 false 时 autoUpdater.enabled() 直接返回 false，
+          # 应用内「检查更新」永远无效。开启后 electron-updater 去读
+          # electron-builder.config.js 的 publish.url —— 已指向本仓库 GitHub Release。
+          ZCODE_AUTO_UPDATE: '1'
+          # 遥测端点保持为空：开源构建没有内部私有配置，显式写空字符串
+          # 让 build-time-config 走「关闭」分支，而不是回落到默认值。
+          ZCODE_ARMS_RUM_ENDPOINT: ''
+          ZCODE_TELEMETRY_REPORT_ENDPOINT: ''
           # 上游 mise.toml 给的是 npmmirror（国内源）。GitHub 托管 runner 在美国，
           # 走国内源会绕远甚至超时，这里覆盖成官方源。
           ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
@@ -266,6 +274,56 @@ jobs:
           [ ${#ZIP[@]} -eq 0 ] || cp "${ZIP[@]}" out/
           ls -la out/
 
+      # electron-updater 的 MacUpdater 只有拿到 <artifact>.blockmap 才会走差分下载，
+      # 否则整包重下。electron-builder 自己产的 zip 已带 blockmap，这里做断言而不是重算，
+      # 避免和 electron-builder 的分块参数不一致。
+      - name: 生成 electron-updater 清单（macOS）
+        if: matrix.platform == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ZIP=(out/*-mac-*.zip)
+          if [ ${#ZIP[@]} -eq 0 ]; then
+            echo "::error::没有 macOS zip，无法作为 OTA 更新源（electron-updater 只认 zip）"
+            exit 1
+          fi
+          TARGET_ZIP="${ZIP[0]}"
+          # electron-updater 按 <files[].url> 去拼 <url>.blockmap，文件名必须对得上。
+          test -f "${TARGET_ZIP}.blockmap" \
+            || { echo "::error::缺少 ${TARGET_ZIP}.blockmap，差分更新会退化成整包下载"; exit 1; }
+          # 清单名必须是 electron-updater 默认的 latest-mac.yml；
+          # app-update.yml 里的 channel: latest 决定了客户端来取这个文件名。
+          VER=$(node -p "require('./packages/desktop/package.json').version")
+          NAME=$(basename "$TARGET_ZIP")
+          FEED="https://github.com/HunterXing/ZCode/releases/download/ci-latest/"
+          SHA=$(openssl dgst -sha512 -binary "$TARGET_ZIP" | openssl base64 -A)
+          SIZE=$(stat -f '%z' "$TARGET_ZIP")
+          cat > out/latest-mac.yml <<YML
+          version: $VER
+          files:
+            - url: ${FEED}$NAME
+              sha512: $SHA
+              size: $SIZE
+          path: $NAME
+          sha512: $SHA
+          releaseDate: '$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'
+          YML
+          echo "--- 生成的 latest-mac.yml ---"
+          sed 's/^/  /' out/latest-mac.yml
+          # app-update.yml 是 electron-updater 运行时判断 enabled() 的依据，
+          # 它的 url 必须是本仓库 Release 而不是构建期的占位值。
+          APP_UPDATE="packages/desktop/dist/mac*/ZCode.app/Contents/Resources/app-update.yml"
+          shopt -s nullglob
+          AU=($APP_UPDATE)
+          if [ ${#AU[@]} -eq 0 ]; then
+            echo "  (app.asar 打包模式，app-update.yml 不在 dist 下，跳过)"
+          else
+            echo "--- app-update.yml ---"; sed 's/^/  /' "${AU[0]}"
+            grep -q 'HunterXing/ZCode/releases' "${AU[0]}" \
+              || { echo "::error::app-update.yml 未指向本仓库 Release，OTA 会指向错误源"; exit 1; }
+          fi
+
       - name: 收集产物（Windows）
         if: matrix.platform == 'Windows'
         shell: bash
@@ -289,6 +347,32 @@ jobs:
           done
           cp "${EXE[@]}" out/
           ls -la out/
+
+      - name: 生成 electron-updater 清单（Windows）
+        if: matrix.platform == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          EXE=(out/*-win-*.exe)
+          [ ${#EXE[@]} -eq 0 ] && { echo "::error::没有 Windows exe"; exit 1; }
+          TARGET_EXE="${EXE[0]}"
+          VER=$(node -p "require('./packages/desktop/package.json').version")
+          NAME=$(basename "$TARGET_EXE")
+          FEED="https://github.com/HunterXing/ZCode/releases/download/ci-latest/"
+          SHA=$(openssl dgst -sha512 -binary "$TARGET_EXE" | openssl base64 -A)
+          SIZE=$(stat -c '%s' "$TARGET_EXE" 2>/dev/null || wc -c < "$TARGET_EXE")
+          cat > out/latest.yml <<YML
+          version: $VER
+          files:
+            - url: ${FEED}$NAME
+              sha512: $SHA
+              size: $SIZE
+          path: $NAME
+          sha512: $SHA
+          releaseDate: '$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'
+          YML
+          echo "--- 生成的 latest.yml ---"; sed 's/^/  /' out/latest.yml
 
       - name: 收集产物（Linux）
         if: matrix.platform == 'Linux'
@@ -325,7 +409,9 @@ jobs:
           ls -1 out/
           # 文件名里必须含版本号。electron-updater 靠把 URL 里的新版本号替换成旧版本号
           # 来定位上一版的 blockmap，名字里没有版本号差分就退化成全量下载。
-          BAD=$(ls -1 out/ | grep -v "$EXPECT" || true)
+          # 例外：electron-updater 的清单文件（latest*.yml）按约定不带版本号，
+          # 它们是固定名字的索引，内容里的 files[].url 才是带版本号的产物地址。
+          BAD=$(ls -1 out/ | grep -v '^latest.*\.yml$' | grep -v "$EXPECT" || true)
           if [ -n "$BAD" ]; then
             echo "::error::以下产物文件名不含版本号 $EXPECT，发布后差分更新会退化为全量下载："
             echo "$BAD"
@@ -371,7 +457,9 @@ jobs:
           set -euo pipefail
           # 版本从产物文件名反推，而不是从仓库 package.json：
           # 后者只是 productVersion，发布出去的 Release 标题会长期显示一个比产物旧的版本。
-          NAME=$(ls -1 dist/ | head -1)
+          # 排除 electron-updater 清单（latest*.yml），它们是固定名索引、不带版本号，
+          # `head -1` 命中它们会让下面的 sed 解析失败。
+          NAME=$(ls -1 dist/ | grep -v '^latest.*\.yml$' | head -1)
           if [ -z "$NAME" ]; then
             echo "::error::没有下载到任何产物"; exit 1
           fi
@@ -398,8 +486,12 @@ jobs:
             **补齐了官方未发布的平台**：官方 release 只有 `mac-arm64.dmg` 与 `win-x64.exe`，
             本构建额外提供 **macOS Intel (x64)** 与 **Linux**（AppImage / deb / rpm / pacman）。
 
+            **支持应用内自动更新**：更新源指向本 Release（tag 固定 `ci-latest`，每次构建覆盖），
+            应用内「检查更新」会比对 `latest-mac.yml` / `latest.yml` 拉取新版。
+            首次安装仍需绕过 Gatekeeper 一次，之后的更新不再受此限制。
+
             **产物未签名、未公证。**
-            - macOS：首次打开需 右键 → 打开 绕过 Gatekeeper；不会出现在「系统设置 → 隐私与安全性」里。
+            - macOS：首次打开需 右键 → 打开 绕过 Gatekeeper。
             - Windows：SmartScreen 弹窗点「更多信息 → 仍要运行」。
             - Linux：AppImage `chmod +x` 后直接运行；deb/rpm/pacman 用对应包管理器安装。
           files: dist/*

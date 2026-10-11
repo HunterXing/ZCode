@@ -770,6 +770,25 @@ describe("autoUpdater ready state sync", () => {
     expect(autoUpdaterMock.checkForUpdates).toHaveBeenCalledTimes(1);
   });
 
+  it("指向自建静态托管的 feed 会切到 electron-updater 原生 provider", async () => {
+    mockProcessPlatform("darwin");
+    process.env["TEST_UPDATER_ARCH"] = "arm64";
+    const { initAutoUpdater } = await import("../src/main/autoUpdater.js");
+    initAutoUpdater({
+      updateFeedSource: {
+        url: "https://github.com/HunterXing/ZCode/releases/download/ci-latest/",
+      },
+    });
+
+    // 自建包把更新源指向自己的 GitHub Release，那里放的是 electron-updater 原生清单
+    // （latest-mac.yml），不是官方的 /api/v1/releases/electron/manifest 接口。
+    // 继续用 ManifestUpdateProvider 会一直 404，必须走 generic provider 去读
+    // app-update.yml 里的 publish.url。
+    expect(autoUpdaterMock.setFeedURL).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "generic" }),
+    );
+  });
+
   it("manifest URL 覆盖不会切换到 generic feed", async () => {
     mockProcessPlatform("darwin");
     process.env["TEST_UPDATER_ARCH"] = "arm64";
