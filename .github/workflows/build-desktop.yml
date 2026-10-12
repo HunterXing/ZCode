@@ -375,7 +375,10 @@ jobs:
             || { echo "::error::缺少 ${TARGET_ZIP}.blockmap，差分更新会退化成整包下载"; exit 1; }
           # 清单名必须是 electron-updater 默认的 latest-mac.yml；
           # app-update.yml 里的 channel: latest 决定了客户端来取这个文件名。
-          VER=$(node -p "require('./packages/desktop/package.json').version")
+          # 版本取**仓库根** package.json：packages/desktop/package.json 是
+          # monorepo 子包，没有 version 字段（取出来是 undefined，会让
+          # 清单里的 version 变成字面量 undefined，客户端版本比较直接失效）。
+          VER=$(node -p "require('./package.json').version")
           NAME=$(basename "$TARGET_ZIP")
           FEED="https://github.com/HunterXing/ZCode/releases/download/ci-latest/"
           SHA=$(openssl dgst -sha512 -binary "$TARGET_ZIP" | openssl base64 -A)
@@ -551,6 +554,48 @@ jobs:
           echo "构建版本: $VER"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "待发布文件："; ls -la dist/
+
+      - name: 合并 macOS 两架构的 electron-updater 清单
+        shell: bash
+        run: |
+          set -euo pipefail
+          # mac-x64 与 mac-arm64 各自产出一个 latest-mac.yml（artifact 内同名），
+          # merge-multiple 合并后会互相覆盖，最后剩的那份对另一个架构是错的：
+          # arm64 客户端会拿到 x64 的 zip。
+          #
+          # 修法：每个架构一份清单，arm64 用 electron-updater 默认名，
+          # x64 用带架构后缀的名字，构建期通过 --zcode-update-feed-url
+          # 或 app-update.yml 的 channel 指向对应清单。
+          shopt -s nullglob
+          ARM_YML=(dist/*-mac-arm64/latest-mac.yml)
+          X64_YML=(dist/*-mac-x64/latest-mac.yml)
+          if [ ${#ARM_YML[@]} -eq 0 ] || [ ${#X64_YML[@]} -eq 0 ]; then
+            echo "::error::缺少某个架构的 latest-mac.yml（arm64=${#ARM_YML[@]} x64=${#X64_YML[@]}）"
+            ls -R dist/ | head -40
+            exit 1
+          fi
+          mkdir -p out-manifests
+          cp "${ARM_YML[0]}" out-manifests/latest-mac.yml
+          cp "${X64_YML[0]}" out-manifests/latest-mac-x64.yml
+          echo "--- arm64 清单 ---"; sed 's/^/  /' out-manifests/latest-mac.yml
+          echo "--- x64 清单 ---";   sed 's/^/  /' out-manifests/latest-mac-x64.yml
+          # 断言：两个清单指向的产物不能是同一个架构
+          ARM_URL=$(grep -m1 'url:' "${ARM_YML[0]}" | sed 's/.*url: *//')
+          X64_URL=$(grep -m1 'url:' "${X64_YML[0]}"  | sed 's/.*url: *//')
+          echo "arm64 -> $ARM_URL"
+          echo "x64   -> $X64_URL"
+          case "$ARM_URL" in *mac-arm64*) ;; *) echo "::error::arm64 清单未指向 arm64 产物：$ARM_URL"; exit 1;; esac
+          case "$X64_URL" in *mac-x64*)   ;; *) echo "::error::x64 清单未指向 x64 产物：$X64_URL";     exit 1;; esac
+          # 清单里的 version 必须是真实版本号，不能是 undefined / null
+          for f in out-manifests/*.yml; do
+            V=$(grep -m1 '^version:' "$f" | sed 's/^version: *//')
+            if [ -z "$V" ] || [ "$V" = "undefined" ] || [ "$V" = "null" ]; then
+              echo "::error::$f 的 version 字段无效：'$V'"; exit 1
+            fi
+            echo "$f version=$V ✅"
+          done
+          # 清单与产物一并发布
+          cp out-manifests/* dist/
 
       - name: 创建 / 覆盖 Release ci-latest
         uses: softprops/action-gh-release@v2
