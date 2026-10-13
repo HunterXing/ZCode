@@ -373,17 +373,26 @@ jobs:
           # electron-updater 按 <files[].url> 去拼 <url>.blockmap，文件名必须对得上。
           test -f "${TARGET_ZIP}.blockmap" \
             || { echo "::error::缺少 ${TARGET_ZIP}.blockmap，差分更新会退化成整包下载"; exit 1; }
-          # 清单名必须是 electron-updater 默认的 latest-mac.yml；
-          # app-update.yml 里的 channel: latest 决定了客户端来取这个文件名。
+          # 清单文件名必须**自带架构**：发布 job 用 download-artifact 的
+          # merge-multiple 合并，四个平台的产物会被平铺到同一个 dist/，
+          # 同名文件在这里就已经互相覆盖了（不是到发布 job 才冲突）。
+          # 所以这里写 latest-mac-arm64.yml / latest-mac-x64.yml，
+          # 发布 job 再把 arm64 那份改名成 electron-updater 默认的
+          # latest-mac.yml（x64 用带后缀的名字，见发布步骤）。
           # 版本取**仓库根** package.json：packages/desktop/package.json 是
           # monorepo 子包，没有 version 字段（取出来是 undefined，会让
           # 清单里的 version 变成字面量 undefined，客户端版本比较直接失效）。
           VER=$(node -p "require('./package.json').version")
           NAME=$(basename "$TARGET_ZIP")
+          case "${{ matrix.target }}" in
+            mac-x64)   MANIFEST=latest-mac-x64.yml   ;;
+            mac-arm64) MANIFEST=latest-mac-arm64.yml ;;
+            *) echo "::error::未知目标"; exit 1 ;;
+          esac
           FEED="https://github.com/HunterXing/ZCode/releases/download/ci-latest/"
           SHA=$(openssl dgst -sha512 -binary "$TARGET_ZIP" | openssl base64 -A)
           SIZE=$(stat -f '%z' "$TARGET_ZIP")
-          cat > out/latest-mac.yml <<YML
+          cat > "out/$MANIFEST" <<YML
           version: $VER
           files:
             - url: ${FEED}$NAME
@@ -393,8 +402,8 @@ jobs:
           sha512: $SHA
           releaseDate: '$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'
           YML
-          echo "--- 生成的 latest-mac.yml ---"
-          sed 's/^/  /' out/latest-mac.yml
+          echo "--- 生成的 $MANIFEST ---"
+          sed 's/^/  /' "out/$MANIFEST"
           # app-update.yml 是 electron-updater 运行时判断 enabled() 的依据，
           # 它的 url 必须是本仓库 Release 而不是构建期的占位值。
           APP_UPDATE="packages/desktop/dist/mac*/ZCode.app/Contents/Resources/app-update.yml"
@@ -555,30 +564,39 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "待发布文件："; ls -la dist/
 
-      - name: 合并 macOS 两架构的 electron-updater 清单
+      - name: 校验并规范化 macOS 两架构的 electron-updater 清单
         shell: bash
         run: |
           set -euo pipefail
-          # mac-x64 与 mac-arm64 各自产出一个 latest-mac.yml（artifact 内同名），
-          # merge-multiple 合并后会互相覆盖，最后剩的那份对另一个架构是错的：
-          # arm64 客户端会拿到 x64 的 zip。
+          # download-artifact 的 merge-multiple 会把四个平台的产物**平铺**到
+          # dist/，不保留 artifact 名做子目录。所以各平台 job 里产出的清单
+          # 必须自带架构（latest-mac-arm64.yml / latest-mac-x64.yml），
+          # 否则在这里就已经只剩一份、且不知道是哪份。
           #
-          # 修法：每个架构一份清单，arm64 用 electron-updater 默认名，
-          # x64 用带架构后缀的名字，构建期通过 --zcode-update-feed-url
-          # 或 app-update.yml 的 channel 指向对应清单。
+          # electron-updater 对 macOS 的取名规则是固定 latest-mac.yml（不分架构），
+          # 所以这里做一次规范化：arm64 那份复制成 electron-updater 认的默认名，
+          # x64 那份保留带架构后缀的名字（x64 客户端用 --zcode-update-feed-url
+          # 或改 channel 指向它）。两份都发布，多留一份不碍事。
           shopt -s nullglob
-          ARM_YML=(dist/*-mac-arm64/latest-mac.yml)
-          X64_YML=(dist/*-mac-x64/latest-mac.yml)
-          if [ ${#ARM_YML[@]} -eq 0 ] || [ ${#X64_YML[@]} -eq 0 ]; then
-            echo "::error::缺少某个架构的 latest-mac.yml（arm64=${#ARM_YML[@]} x64=${#X64_YML[@]}）"
-            ls -R dist/ | head -40
+          ARM_YML=(dist/latest-mac-arm64.yml)
+          X64_YML=(dist/latest-mac-x64.yml)
+          # 注意：上面这种「字面量路径」写法**不会**触发 glob 展开
+          # （模式里没有 * ? [ ），所以 nullglob 也不生效 ——
+          # 文件不存在时数组照样有 1 个元素，内容是那个字面量路径。
+          # 直接数 ${#ARM_YML[@]} 会把「不存在」误判成「存在」，
+          # 后面 grep 才会以一个看不懂的 ENOENT 失败。
+          # 所以这里用 -f 显式判存在，不用数组计数判存在。
+          MISSING=""
+          [ -f dist/latest-mac-arm64.yml ] || MISSING="$MISSING latest-mac-arm64.yml"
+          [ -f dist/latest-mac-x64.yml ]   || MISSING="$MISSING latest-mac-x64.yml"
+          if [ -n "$MISSING" ]; then
+            echo "::error::缺少 mac 清单：$MISSING"
+            echo "dist/ 实际内容："; ls -1 dist/
             exit 1
           fi
-          mkdir -p out-manifests
-          cp "${ARM_YML[0]}" out-manifests/latest-mac.yml
-          cp "${X64_YML[0]}" out-manifests/latest-mac-x64.yml
-          echo "--- arm64 清单 ---"; sed 's/^/  /' out-manifests/latest-mac.yml
-          echo "--- x64 清单 ---";   sed 's/^/  /' out-manifests/latest-mac-x64.yml
+          cp "${ARM_YML[0]}" dist/latest-mac.yml
+          echo "--- arm64 清单（同时发布为 latest-mac.yml）---"; sed 's/^/  /' dist/latest-mac.yml
+          echo "--- x64 清单 ---";                              sed 's/^/  /' "${X64_YML[0]}"
           # 断言：两个清单指向的产物不能是同一个架构
           ARM_URL=$(grep -m1 'url:' "${ARM_YML[0]}" | sed 's/.*url: *//')
           X64_URL=$(grep -m1 'url:' "${X64_YML[0]}"  | sed 's/.*url: *//')
@@ -587,15 +605,18 @@ jobs:
           case "$ARM_URL" in *mac-arm64*) ;; *) echo "::error::arm64 清单未指向 arm64 产物：$ARM_URL"; exit 1;; esac
           case "$X64_URL" in *mac-x64*)   ;; *) echo "::error::x64 清单未指向 x64 产物：$X64_URL";     exit 1;; esac
           # 清单里的 version 必须是真实版本号，不能是 undefined / null
-          for f in out-manifests/*.yml; do
+          for f in dist/latest*.yml; do
             V=$(grep -m1 '^version:' "$f" | sed 's/^version: *//')
             if [ -z "$V" ] || [ "$V" = "undefined" ] || [ "$V" = "null" ]; then
               echo "::error::$f 的 version 字段无效：'$V'"; exit 1
             fi
-            echo "$f version=$V ✅"
+            # sha512 也不能是 undefined，否则客户端下载后校验必然失败
+            S=$(grep -m1 'sha512:' "$f" | sed 's/.*sha512: *//')
+            if [ -z "$S" ] || [ "$S" = "undefined" ]; then
+              echo "::error::$f 的 sha512 字段无效：'$S'"; exit 1
+            fi
+            echo "$f  version=$V  sha512 ✅"
           done
-          # 清单与产物一并发布
-          cp out-manifests/* dist/
 
       - name: 创建 / 覆盖 Release ci-latest
         uses: softprops/action-gh-release@v2
