@@ -404,6 +404,11 @@ jobs:
           YML
           echo "--- 生成的 $MANIFEST ---"
           sed 's/^/  /' "out/$MANIFEST"
+          # 自检必须拿**独立读到的**仓库版本做对比，不能拿写文件用的 $VER
+          # 自己比自己 —— 那样永远成立，等于没检查（$VER 本身就是错的也照样过）。
+          EXPECT=$(node -p "require('./package.json').version")
+          grep -q "^version: ${EXPECT}$" "out/$MANIFEST" \
+            || { echo "::error::$MANIFEST 的 version 不是仓库版本 $EXPECT（实际 $VER）"; exit 1; }
           # app-update.yml 是 electron-updater 运行时判断 enabled() 的依据，
           # 它的 url 必须是本仓库 Release 而不是构建期的占位值。
           APP_UPDATE="packages/desktop/dist/mac*/ZCode.app/Contents/Resources/app-update.yml"
@@ -450,7 +455,10 @@ jobs:
           EXE=(out/*-win-*.exe)
           [ ${#EXE[@]} -eq 0 ] && { echo "::error::没有 Windows exe"; exit 1; }
           TARGET_EXE="${EXE[0]}"
-          VER=$(node -p "require('./packages/desktop/package.json').version")
+          # 版本取**仓库根** package.json：packages/desktop/package.json 是
+          # monorepo 子包，没有 version 字段（取出来是 undefined，会让清单里的
+          # version 变成字面量 undefined，客户端新旧比较直接失效）。
+          VER=$(node -p "require('./package.json').version")
           NAME=$(basename "$TARGET_EXE")
           FEED="https://github.com/HunterXing/ZCode/releases/download/ci-latest/"
           SHA=$(openssl dgst -sha512 -binary "$TARGET_EXE" | openssl base64 -A)
@@ -466,6 +474,14 @@ jobs:
           releaseDate: '$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'
           YML
           echo "--- 生成的 latest.yml ---"; sed 's/^/  /' out/latest.yml
+          # 立刻自检清单的 version：electron-updater 靠它做新旧比较。
+          # 历史上这里取过 packages/desktop/package.json 的 version（monorepo
+          # 子包没有该字段 → 字面量 undefined），要等四个平台全部跑完、
+          # 到发布 job 才被发现，白烧四个 runner。这里就地拦住。
+          # 对比基准必须独立读仓库版本，不能拿写文件用的 $VER 自己比自己。
+          EXPECT=$(node -p "require('./package.json').version")
+          grep -q "^version: ${EXPECT}$" out/latest.yml \
+            || { echo "::error::latest.yml 的 version 不是仓库版本 $EXPECT（实际 $VER）"; exit 1; }
 
       - name: 收集产物（Linux）
         if: matrix.platform == 'Linux'
